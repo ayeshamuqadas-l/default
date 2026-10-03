@@ -1,0 +1,583 @@
+/**
+ * Power Supply Fault Finder Simulation Provider
+ * ID: power-supply-fault-finder
+ * Category: ED (Electronic Devices)
+ *
+ * Physics Contract & Model Details:
+ * --------------------------------
+ * Inputs:
+ *   - faultIndex: 0 (none), 1 (open diode), 2 (shorted diode), 3 (open C), 
+ *                 4 (shorted C), 5 (leaky C), 6 (open winding), 7 (open load)
+ *   - topology: 0 (centre-tapped), 1 (bridge)
+ *   - capUF: Filter Capacitance (1 to 4700 uF)
+ *   - loadOhm: Load Resistance (10 to 10000 Ω)
+ *   - vpSec: Secondary Peak Voltage (5 to 50 V)
+ *   - diagnoseMode: 0 (Explore mode), 1 (Diagnose mode)
+ *
+ * Primary Misconception Addressed:
+ *   - An open diode in a full-wave rectifier does NOT collapse the output to zero.
+ *     Instead, it degrades the circuit to half-wave operation: ripple frequency halves 
+ *     (100 Hz -> 50 Hz), ripple voltage roughly doubles, and DC output voltage drops.
+ *
+ * Limiting Behaviors & Assumptions:
+ *   - Single-fault injection model (steady-state, ideal oscilloscope, no transients).
+ *   - Frequency line input fixed at f = 50 Hz.
+ *   - Open capacitor produces unfiltered full-wave rectified trace (V_DC = 0.637 * V_p).
+ *   - Shorted capacitor and open winding collapse output voltage completely (V_out = 0 V).
+ *   - Leaky capacitor increases ripple voltage while maintaining the 100 Hz ripple frequency.
+ */
+
+export class Physics extends PhysicsBase {
+  // --- 1. Defaults ---
+  getDefaults() {
+    return {
+      faultIndex: 0,
+      topology: 1, // 0: Centre-tapped, 1: Bridge
+      capUF: 1000,
+      loadOhm: 100,
+      vpSec: 34,
+      diagnoseMode: 0,
+      hiddenFault: null,
+      score: 0,
+      time: 0
+    };
+  }
+
+  // --- 2. Initialization ---
+  init() {
+    this.model = {
+      waveformSamples: [],
+      refSamples: [],
+      vdc: 0,
+      vrpp: 0,
+      ripFreq: 0,
+      expectedRipFreq: 100,
+      verdict: null,
+      faultList: [
+        'No Fault (Healthy)',
+        'Open Diode',
+        'Shorted Diode',
+        'Open Filter Capacitor',
+        'Shorted Filter Capacitor',
+        'Leaky Filter Capacitor',
+        'Open Transformer Winding',
+        'Open Load'
+      ]
+    };
+    if (this.state.diagnoseMode && this.state.hiddenFault === null) {
+      this.pickRandomFault();
+    }
+  }
+
+  pickRandomFault() {
+    // Pick a random fault from index 1 to 7
+    const randomFault = Math.floor(Math.random() * 7) + 1;
+    this.setState({ hiddenFault: randomFault, verdict: null });
+  }
+
+  // --- 3. Controls ---
+  getControls() {
+    const isDiagnose = !!this.state.diagnoseMode;
+    return [
+      {
+        key: 'faultIndex',
+        label: 'Injected Fault',
+        type: 'select',
+        options: this.model.faultList.map((name, idx) => ({ value: idx, label: name })),
+        default: 0,
+        disabled: isDiagnose,
+        info: '0: None, 1: Open Diode, 2: Shorted Diode, 3: Open C, 4: Shorted C, 5: Leaky C, 6: Open Winding, 7: Open Load.'
+      },
+      {
+        key: 'topology',
+        label: 'Rectifier Topology',
+        type: 'select',
+        options: [
+          { value: 0, label: 'Centre-Tapped' },
+          { value: 1, label: 'Bridge' }
+        ],
+        default: 1,
+        disabled: isDiagnose
+      },
+      {
+        key: 'capUF',
+        label: 'Filter Capacitance (C)',
+        min: 1,
+        max: 4700,
+        step: 1,
+        default: 1000,
+        unit: 'µF',
+        info: 'Healthy value of the filter capacitor.'
+      },
+      {
+        key: 'loadOhm',
+        label: 'Load Resistance (R_L)',
+        min: 10,
+        max: 10000,
+        step: 10,
+        default: 100,
+        unit: 'Ω',
+        info: 'Load the power supply is driving.'
+      },
+      {
+        key: 'vpSec',
+        label: 'Secondary Peak (V_p(sec))',
+        min: 5,
+        max: 50,
+        step: 0.5,
+        default: 34,
+        unit: 'V',
+        info: 'Peak AC voltage at transformer secondary.'
+      },
+      {
+        key: 'diagnoseMode',
+        label: 'Diagnose Mode',
+        type: 'toggle',
+        default: 0,
+        info: 'Hides injected fault selection and challenges you to identify the fault from the scope trace.'
+      }
+    ];
+  }
+
+  // --- 4. Physics Engine & Waveform Calculation ---
+  update(dt) {
+    this.state.time += dt;
+
+    const fLine = 50; // Standard 50 Hz AC Line
+    const activeFault = this.state.diagnoseMode ? this.state.hiddenFault : this.state.faultIndex;
+    const isBridge = this.state.topology === 1;
+
+    // Diode forward drops
+    const vDrop = isBridge ? 1.4 : 0.7;
+    const vpRect = Math.max(0, this.state.vpSec - vDrop);
+
+    // Compute healthy reference trace
+    const C = this.state.capUF * 1e-6;
+    const RL = this.state.loadOhm;
+    const refVrpp = vpRect / (2 * fLine * RL * C);
+    const refVdc = vpRect - refVrpp / 2;
+
+    const numPoints = 300;
+    const tSpan = 0.04; // 2 cycles at 50 Hz (40 ms)
+    const refSamples = new Array(numPoints);
+    const waveformSamples = new Array(numPoints);
+
+    // Compute Healthy Reference Samples
+    for (let i = 0; i < numPoints; i++) {
+      const t = (i / (numPoints - 1)) * tSpan;
+      const period = 1 / (2 * fLine); // Full-wave recharges every 10 ms
+      const phase = t % period;
+      refSamples[i] = Math.max(0, vpRect - (refVrpp * (phase / period)));
+    }
+    this.model.refSamples = refSamples;
+
+    // Fault Modifications
+    let vdc = 0;
+    let vrpp = 0;
+    let ripFreq = 100;
+
+    switch (activeFault) {
+      case 0: { // Healthy (No Fault)
+        ripFreq = 100;
+        vrpp = Math.min(vpRect, refVrpp);
+        vdc = vpRect - vrpp / 2;
+        for (let i = 0; i < numPoints; i++) {
+          const t = (i / (numPoints - 1)) * tSpan;
+          const phase = t % (1 / ripFreq);
+          waveformSamples[i] = Math.max(0, vpRect - (vrpp * (phase * ripFreq)));
+        }
+        break;
+      }
+      case 1: { // Open Diode
+        // In full-wave, ripple frequency halves to 50 Hz and ripple doubles
+        ripFreq = 50;
+        vrpp = Math.min(vpRect, vpRect / (fLine * RL * C));
+        vdc = vpRect - vrpp / 2;
+        for (let i = 0; i < numPoints; i++) {
+          const t = (i / (numPoints - 1)) * tSpan;
+          const cycleTime = t % (1 / fLine);
+          // Recharges once every cycle (20ms) instead of twice
+          if (cycleTime < 0.005) { // Charging phase
+            waveformSamples[i] = vpRect * Math.sin(2 * Math.PI * fLine * cycleTime);
+          } else {
+            waveformSamples[i] = Math.max(0, vpRect - vrpp * ((cycleTime - 0.005) / 0.015));
+          }
+        }
+        break;
+      }
+      case 2: { // Shorted Diode
+        // Collapses supply or opens fuse on negative half-cycle -> V_out = 0 V
+        vdc = 0; vrpp = 0; ripFreq = 0;
+        for (let i = 0; i < numPoints; i++) waveformSamples[i] = 0;
+        break;
+      }
+      case 3: { // Open Filter Capacitor
+        // Unfiltered full-wave rectified sine wave
+        ripFreq = 100;
+        vdc = 0.637 * vpRect;
+        vrpp = vpRect;
+        for (let i = 0; i < numPoints; i++) {
+          const t = (i / (numPoints - 1)) * tSpan;
+          waveformSamples[i] = Math.abs(vpRect * Math.sin(2 * Math.PI * fLine * t));
+        }
+        break;
+      }
+      case 4: { // Shorted Filter Capacitor
+        // Output zeroed completely
+        vdc = 0; vrpp = 0; ripFreq = 0;
+        for (let i = 0; i < numPoints; i++) waveformSamples[i] = 0;
+        break;
+      }
+      case 5: { // Leaky Filter Capacitor
+        // Effective load = RL || R_leak (say R_leak = 25 Ω)
+        const rLeak = 25;
+        const rEff = (RL * rLeak) / (RL + rLeak);
+        ripFreq = 100;
+        vrpp = Math.min(vpRect, vpRect / (2 * fLine * rEff * C));
+        vdc = vpRect - vrpp / 2;
+        for (let i = 0; i < numPoints; i++) {
+          const t = (i / (numPoints - 1)) * tSpan;
+          const phase = t % (1 / ripFreq);
+          waveformSamples[i] = Math.max(0, vpRect - (vrpp * (phase * ripFreq)));
+        }
+        break;
+      }
+      case 6: { // Open Transformer Winding
+        // Zero output voltage
+        vdc = 0; vrpp = 0; ripFreq = 0;
+        for (let i = 0; i < numPoints; i++) waveformSamples[i] = 0;
+        break;
+      }
+      case 7: { // Open Load
+        // No load current -> capacitor holds peak voltage continuously
+        ripFreq = 0;
+        vrpp = 0;
+        vdc = vpRect;
+        for (let i = 0; i < numPoints; i++) waveformSamples[i] = vpRect;
+        break;
+      }
+    }
+
+    this.model.waveformSamples = waveformSamples;
+    this.model.vdc = vdc;
+    this.model.vrpp = vrpp;
+    this.model.ripFreq = ripFreq;
+  }
+
+  // --- 5. Layered Rendering ---
+  getLayers() {
+    return [
+      { name: 'background', render: (ctx, bounds) => this.renderGrid(ctx, bounds) },
+      { name: 'schematic', render: (ctx, bounds) => this.renderSchematic(ctx, bounds) },
+      { name: 'reference', render: (ctx, bounds) => this.renderReferenceTrace(ctx, bounds) },
+      { name: 'waveform', render: (ctx, bounds) => this.renderWaveformTrace(ctx, bounds) },
+      { name: 'measure', render: (ctx, bounds) => this.renderMeasurementCursors(ctx, bounds) },
+      { name: 'readout', render: (ctx, bounds) => this.renderReadoutOverlay(ctx, bounds) }
+    ];
+  }
+
+  renderGrid(ctx, bounds) {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, bounds.width, bounds.height);
+
+    // Oscilloscope Screen Frame
+    const scopeX = bounds.width * 0.42;
+    const scopeY = 20;
+    const scopeW = bounds.width * 0.55;
+    const scopeH = bounds.height - 40;
+
+    ctx.fillStyle = '#111128';
+    ctx.fillRect(scopeX, scopeY, scopeW, scopeH);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+    ctx.lineWidth = 1;
+    const cols = 8;
+    const rows = 6;
+
+    for (let c = 0; c <= cols; c++) {
+      const x = scopeX + (c / cols) * scopeW;
+      ctx.beginPath();
+      ctx.moveTo(x, scopeY);
+      ctx.lineTo(x, scopeY + scopeH);
+      ctx.stroke();
+    }
+    for (let r = 0; r <= rows; r++) {
+      const y = scopeY + (r / rows) * scopeH;
+      ctx.beginPath();
+      ctx.moveTo(scopeX, y);
+      ctx.lineTo(scopeX + scopeW, y);
+      ctx.stroke();
+    }
+  }
+
+  renderSchematic(ctx, bounds) {
+    const schX = 15;
+    const schY = 20;
+    const schW = bounds.width * 0.38;
+    const schH = bounds.height - 40;
+
+    ctx.fillStyle = 'rgba(17, 17, 40, 0.6)';
+    ctx.fillRect(schX, schY, schW, schH);
+    ctx.strokeStyle = '#e8871e';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(schX, schY, schW, schH);
+
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('Power Supply Schematic', schX + 12, schY + 22);
+
+    const activeFault = this.state.diagnoseMode ? null : this.state.faultIndex;
+
+    // Helper to draw fault marker cross
+    const drawFaultX = (x, y) => {
+      ctx.strokeStyle = '#ff3366';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x - 8, y - 8); ctx.lineTo(x + 8, y + 8);
+      ctx.moveTo(x + 8, y - 8); ctx.lineTo(x - 8, y + 8);
+      ctx.stroke();
+    };
+
+    // Draw Transformer
+    ctx.strokeStyle = '#e8e8f0';
+    ctx.lineWidth = 2;
+    const txCenterX = schX + 50;
+    const txCenterY = schY + schH / 2;
+
+    ctx.beginPath();
+    ctx.arc(txCenterX - 15, txCenterY - 25, 12, -Math.PI / 2, Math.PI / 2);
+    ctx.arc(txCenterX - 15, txCenterY + 5, 12, -Math.PI / 2, Math.PI / 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(txCenterX + 15, txCenterY - 25, 12, Math.PI / 2, -Math.PI / 2);
+    ctx.arc(txCenterX + 15, txCenterY + 5, 12, Math.PI / 2, -Math.PI / 2);
+    ctx.stroke();
+
+    if (activeFault === 6) drawFaultX(txCenterX, txCenterY);
+
+    // Draw Rectifier
+    const rectX = schX + 130;
+    const rectY = txCenterY;
+    ctx.strokeRect(rectX - 15, rectY - 30, 30, 60);
+    ctx.fillStyle = '#a0a0c0';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(this.state.topology === 1 ? 'Bridge' : 'Center-Tap', rectX - 25, rectY + 45);
+
+    if (activeFault === 1 || activeFault === 2) drawFaultX(rectX, rectY);
+
+    // Draw Filter Capacitor
+    const capX = schX + 200;
+    ctx.beginPath();
+    ctx.moveTo(capX, rectY - 30); ctx.lineTo(capX, rectY - 8);
+    ctx.moveTo(capX - 12, rectY - 8); ctx.lineTo(capX + 12, rectY - 8);
+    ctx.moveTo(capX - 12, rectY + 8); ctx.lineTo(capX + 12, rectY + 8);
+    ctx.moveTo(capX, rectY + 8); ctx.lineTo(capX, rectY + 30);
+    ctx.stroke();
+    ctx.fillText(`${this.state.capUF}µF`, capX - 15, rectY + 45);
+
+    if (activeFault === 3 || activeFault === 4 || activeFault === 5) drawFaultX(capX, rectY);
+
+    // Draw Load Resistor
+    const loadX = schX + 260;
+    ctx.beginPath();
+    ctx.moveTo(loadX, rectY - 30); ctx.lineTo(loadX, rectY - 15);
+    ctx.rect(loadX - 8, rectY - 15, 16, 30);
+    ctx.moveTo(loadX, rectY + 15); ctx.lineTo(loadX, rectY + 30);
+    ctx.stroke();
+    ctx.fillText(`${this.state.loadOhm}Ω`, loadX - 12, rectY + 45);
+
+    if (activeFault === 7) drawFaultX(loadX, rectY);
+
+    // Connecting wires
+    ctx.beginPath();
+    ctx.moveTo(rectX + 15, rectY - 30); ctx.lineTo(loadX, rectY - 30);
+    ctx.moveTo(rectX + 15, rectY + 30); ctx.lineTo(loadX, rectY + 30);
+    ctx.stroke();
+  }
+
+  renderReferenceTrace(ctx, bounds) {
+    const scopeX = bounds.width * 0.42;
+    const scopeY = 20;
+    const scopeW = bounds.width * 0.55;
+    const scopeH = bounds.height - 40;
+
+    const samples = this.model.refSamples;
+    if (!samples || samples.length === 0) return;
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+
+    const maxVolts = 50; // Scale 0..50V
+    ctx.beginPath();
+    for (let i = 0; i < samples.length; i++) {
+      const x = scopeX + (i / (samples.length - 1)) * scopeW;
+      const y = scopeY + scopeH - (samples[i] / maxVolts) * scopeH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  renderWaveformTrace(ctx, bounds) {
+    const scopeX = bounds.width * 0.42;
+    const scopeY = 20;
+    const scopeW = bounds.width * 0.55;
+    const scopeH = bounds.height - 40;
+
+    const samples = this.model.waveformSamples;
+    if (!samples || samples.length === 0) return;
+
+    ctx.strokeStyle = '#e8871e';
+    ctx.lineWidth = 2.5;
+
+    const maxVolts = 50;
+    ctx.beginPath();
+    for (let i = 0; i < samples.length; i++) {
+      const x = scopeX + (i / (samples.length - 1)) * scopeW;
+      const y = scopeY + scopeH - (samples[i] / maxVolts) * scopeH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  renderMeasurementCursors(ctx, bounds) {
+    const scopeX = bounds.width * 0.42;
+    const scopeY = 20;
+    const scopeW = bounds.width * 0.55;
+    const scopeH = bounds.height - 40;
+    const maxVolts = 50;
+
+    // Draw V_DC Cursor Baseline
+    const yVdc = scopeY + scopeH - (this.model.vdc / maxVolts) * scopeH;
+    ctx.strokeStyle = '#00e676';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(scopeX, yVdc);
+    ctx.lineTo(scopeX + scopeW, yVdc);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#00e676';
+    ctx.font = '10px monospace';
+    ctx.fillText(`V_DC = ${this.model.vdc.toFixed(1)}V`, scopeX + 10, yVdc - 4);
+  }
+
+  renderReadoutOverlay(ctx, bounds) {
+    // Readout cards on scope area
+    const cardX = bounds.width * 0.42 + 15;
+    let cardY = 30;
+
+    const drawCard = (label, value, color = '#e8e8f0') => {
+      ctx.fillStyle = 'rgba(17, 17, 40, 0.85)';
+      ctx.fillRect(cardX, cardY, 150, 32);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(cardX, cardY, 150, 32);
+
+      ctx.fillStyle = '#a0a0c0';
+      ctx.font = '10px sans-serif';
+      ctx.fillText(label, cardX + 8, cardY + 12);
+
+      ctx.fillStyle = color;
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(value, cardX + 8, cardY + 26);
+
+      cardY += 38;
+    };
+
+    drawCard('RIPPLE FREQUENCY', `${this.model.ripFreq} Hz`, '#00d4ff');
+    drawCard('V_DC LEVEL', `${this.model.vdc.toFixed(1)} V`, '#00e676');
+    drawCard('RIPPLE V_r(pp)', `${this.model.vrpp.toFixed(2)} V`, '#ff6b9d');
+
+    // Diagnose Mode UI Controls & Score
+    if (this.state.diagnoseMode) {
+      ctx.fillStyle = 'rgba(17, 17, 40, 0.9)';
+      ctx.fillRect(bounds.width * 0.42 + 180, 30, 220, 110);
+      ctx.strokeStyle = '#e8871e';
+      ctx.strokeRect(bounds.width * 0.42 + 180, 30, 220, 110);
+
+      ctx.fillStyle = '#e8e8f0';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillText('DIAGNOSE MODE ACTIVE', bounds.width * 0.42 + 190, 48);
+      ctx.font = '11px sans-serif';
+      ctx.fillText(`Score: ${this.state.score} pts`, bounds.width * 0.42 + 190, 66);
+      ctx.fillText('Identify the injected fault', bounds.width * 0.42 + 190, 84);
+
+      if (this.model.verdict) {
+        ctx.fillStyle = this.model.verdict.correct ? '#00e676' : '#ff3366';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.fillText(this.model.verdict.text, bounds.width * 0.42 + 190, 110);
+      }
+    }
+  }
+
+  // --- 6. Theory & Equations ---
+  getDescription() {
+    return `
+      <h3>Power Supply Troubleshooting Theory</h3>
+      <p>This simulation models a complete regulated DC power supply (Transformer, Rectifier, Filter, Load) under single-fault injection conditions.</p>
+      <p><strong>Primary Measurement Indicators:</strong></p>
+      <ul>
+        <li><strong>Ripple Frequency (f<sub>ripple</sub>):</strong> Signature diagnostic! A halved frequency (100 Hz &rarr; 50 Hz) identifies an open diode or path in full-wave rectifiers.</li>
+        <li><strong>V<sub>DC</sub> Level:</strong> Drop in average DC output voltage indicates missing conduction cycles or heavy leakage.</li>
+        <li><strong>Peak-to-Peak Ripple (V<sub>r(pp)</sub>):</strong> Increases under heavy load or degraded capacitance.</li>
+      </ul>
+      <p><em>Model Approximation: Ideal single-fault analysis in steady-state AC conditions without non-linear diode thermal runaway.</em></p>
+    `;
+  }
+
+  getEquations() {
+    return [
+      "f_{ripple} = 2f \\;\\rightarrow\\; f \\quad \\text{(Open diode signature in full-wave)}",
+      "V_{r(pp)} = \\frac{V_{p(rect)}}{f R_L C}",
+      "V_{DC} = 0.637 V_p \\quad \\text{(Unfiltered open capacitor output)}",
+      "R_{eff} = R_L \\parallel R_{leak} \\quad \\text{(Leaky filter capacitor)}",
+      "V_{out} = 0 \\quad \\text{(Shorted capacitor or open transformer winding)}"
+    ];
+  }
+
+  // --- 7. Theory Pop-ups Content Engine ---
+  getTheoryPopups() {
+    return {
+      ripfreq: {
+        heading: "Ripple Frequency as a Diagnostic",
+        realWorldIntuition: "A mechanic listening to an engine does not measure how loud it is; he counts how often it knocks. The rate tells him which cylinder. Ripple frequency is the same kind of clue: amplitude tells you how bad things are, frequency tells you where to look.",
+        physicsExplanation: "The ripple frequency is set purely by how many times per second the filter capacitor is recharged, which is set by how many conduction paths are working. A healthy full-wave supply recharges twice per input cycle. Lose one path and it recharges once, so the frequency halves. No component value in the circuit can change this number—only topology or a fault can.",
+        mathematicalCondition: "Healthy full-wave on a 50 Hz line gives 100 Hz ripple. An open diode gives 50 Hz. The amplitude then follows with the halved frequency, doubling V_r(pp) and dropping V_DC.",
+        physicalConsequence: "Measuring ripple frequency first is faster on a real bench than resistance checks because it requires no unsoldering or power-down."
+      },
+      opendiode: {
+        heading: "The Open Diode — The Fault Everyone Gets Wrong",
+        realWorldIntuition: "A two-lane road with one lane closed does not become impassable. Traffic still flows in bursts at half the rate with longer gaps.",
+        physicsExplanation: "In a bridge, diagonal diode pairs conduct on alternate half-cycles. An open diode disables one pair, so one half-cycle no longer reaches the load while the other does. The supply quietly becomes a half-wave rectifier with a filter capacitor sized for full-wave duty.",
+        mathematicalCondition: "Ripple frequency halves from 2f to f. V_r(pp) doubles and V_DC drops accordingly.",
+        physicalConsequence: "The supply often works fine under light load and fails under full load, making it a tricky fault to diagnose without scope frequency checks."
+      },
+      shortedcap: {
+        heading: "Shorted Capacitor — Zero Output and Fuse Risk",
+        realWorldIntuition: "A burst main pipe dumps water continuously before reaching the tap.",
+        physicsExplanation: "A shorted capacitor places near-zero resistance directly across the rectifier output. Output collapses to zero, drawing massive fault current.",
+        mathematicalCondition: "V_out = 0 V. Indistinguishable from an open transformer winding by voltage alone; resistance checks with power off are required.",
+        physicalConsequence: "Check and replace protection fuses and rectifier diodes before installing a replacement capacitor."
+      },
+      leaky: {
+        heading: "The Leaky Capacitor — Mimicking Heavy Load",
+        realWorldIntuition: "A leaky bucket loses water during a long walk home.",
+        physicsExplanation: "A leaky capacitor behaves as a healthy capacitor in parallel with a leakage resistor, discharging faster between AC peaks.",
+        mathematicalCondition: "R_eff = R_L || R_leak, increasing V_r(pp) while preserving the healthy 100 Hz ripple frequency.",
+        physicalConsequence: "Increased ripple at correct frequency isolates the fault to capacitor leakage or overload."
+      }
+    };
+  }
+
+  destroy() {
+
+  }
+}
